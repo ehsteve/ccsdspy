@@ -2,6 +2,7 @@
 
 from __future__ import division
 from collections import namedtuple
+import importlib
 import math
 import warnings
 
@@ -13,6 +14,47 @@ from ccsdspy.constants import (
 )
 
 __author__ = "Daniel da Silva <mail@danieldasilva.org>"
+
+_get_packet_starts_cython = None
+_cython_packet_starts_checked = False
+
+
+def _load_cython_packet_starts():
+    global _get_packet_starts_cython
+    global _cython_packet_starts_checked
+
+    if _cython_packet_starts_checked:
+        return _get_packet_starts_cython
+
+    _cython_packet_starts_checked = True
+
+    try:
+        module = importlib.import_module("ccsdspy._varlength_cython")
+    except ImportError:
+        _get_packet_starts_cython = None
+    else:
+        _get_packet_starts_cython = module.get_packet_starts
+
+    return _get_packet_starts_cython
+
+
+def _get_packet_starts_python(file_bytes):
+    packet_starts = []
+    offset = 0
+
+    while offset < len(file_bytes):
+        packet_starts.append(offset)
+        offset += int(file_bytes[offset + 4]) * 256 + int(file_bytes[offset + 5]) + 7
+
+    return packet_starts, offset
+
+
+def _get_packet_starts(file_bytes):
+    cython_packet_starts = _load_cython_packet_starts()
+    if cython_packet_starts is not None:
+        return cython_packet_starts(file_bytes)
+
+    return _get_packet_starts_python(file_bytes)
 
 
 def _get_packet_total_bytes(primary_header_bytes):
@@ -265,6 +307,64 @@ def _decode_fixed_length(file_bytes, fields):
     return field_arrays
 
 
+def _varlength_precompute_field_configs(fields, bit_offsets):
+    """Precompute field metadata that doesn't change per packet.
+    
+    For non-expanding fields, many calculations (nbytes, alignment, bit shifts)
+    are constant and can be computed once before the packet loop.
+    
+    Parameters
+    ----------
+    fields : list of ccsdspy.PacketField
+        A list of fields, excluding the primary header.
+    bit_offsets : dict
+        Static bit offsets for fields.
+    
+    Returns
+    -------
+    field_configs : dict
+        Dictionary mapping field names to precomputed metadata.
+    """
+    field_configs = {}
+    
+    for i, field in enumerate(fields):
+        # Skip expanding and variable-length fields
+        if isinstance(field._array_shape, str) or field._array_shape == "expand":
+            field_configs[field._name] = {"is_expanding": True}
+            continue
+        
+        # Skip fields without static bit offsets (e.g., footer fields after expanding arrays)
+        if field._name not in bit_offsets:
+            field_configs[field._name] = {"is_expanding": True}
+            continue
+        
+        # For non-expanding fields, compute constant metadata
+        field_configs[field._name] = {"is_expanding": False}
+        config = field_configs[field._name]
+        
+        bit_offset = bit_offsets[field._name]
+        
+        # Compute nbytes_file based on field._bit_length (constant for non-expanding)
+        nbytes_file = (
+            (bit_offset + field._bit_length - 1) // BITS_PER_BYTE
+            - bit_offset // BITS_PER_BYTE
+            + 1
+        )
+        nbytes_final = {3: 4, 5: 8, 6: 8, 7: 8}.get(nbytes_file, nbytes_file)
+        xbytes = int(nbytes_final) - int(nbytes_file)
+        
+        config["nbytes_file"] = nbytes_file
+        config["nbytes_final"] = nbytes_final
+        config["xbytes"] = xbytes
+        config["bit_offset_static"] = bit_offset
+        config["is_byte_aligned_static"] = (bit_offset % BITS_PER_BYTE == 0) and (
+            field._bit_length % BITS_PER_BYTE == 0
+        )
+        config["left_bits_before_shift"] = bit_offset % BITS_PER_BYTE
+    
+    return field_configs
+
+
 def _decode_variable_length(file_bytes, fields):
     """Decode a variable length packet stream of a single APID.
 
@@ -282,12 +382,7 @@ def _decode_variable_length(file_bytes, fields):
     A dictionary mapping field names to NumPy arrays, stored in the same order as the fields.
     """
     # Get start indices of each packet -------------------------------------
-    packet_starts = []
-    offset = 0
-
-    while offset < len(file_bytes):
-        packet_starts.append(offset)
-        offset += int(file_bytes[offset + 4]) * 256 + int(file_bytes[offset + 5]) + 7
+    packet_starts, offset = _get_packet_starts(file_bytes)
 
     if offset != len(file_bytes):
         missing_bytes = offset - len(file_bytes)
@@ -302,6 +397,10 @@ def _decode_variable_length(file_bytes, fields):
     # that can be determined before parsing each packet.
     # ------------------------------------------------------------------------
     field_arrays, numpy_dtypes, bit_offsets = _varlength_intialize_field_arrays(fields, npackets)
+    
+    # Precompute field metadata that doesn't change per packet
+    # ---------------------------------------------------------------
+    field_configs = _varlength_precompute_field_configs(fields, bit_offsets)
 
     # Loop through packets
     # ----------------------------------------------------------------------------
@@ -347,9 +446,15 @@ def _decode_variable_length(file_bytes, fields):
                     + packet_nbytes
                     + int(bit_offsets_cur[field._name]) // BITS_PER_BYTE
                 )
+                bit_offset_abs = packet_nbytes * BITS_PER_BYTE + int(bit_offsets_cur[field._name])
             else:
                 # Header byte before expanding field: Referenced from start of packet
                 start_byte = packet_start + int(bit_offsets_cur[field._name]) // BITS_PER_BYTE
+                bit_offset_abs = int(bit_offsets_cur[field._name])
+
+            is_byte_aligned = (bit_offset_abs % BITS_PER_BYTE == 0) and (
+                bit_length % BITS_PER_BYTE == 0
+            )
 
             if isinstance(field._array_shape, str):
                 stop_byte = start_byte + int(bit_lengths_cur[field._name]) // BITS_PER_BYTE
@@ -357,20 +462,41 @@ def _decode_variable_length(file_bytes, fields):
             else:
                 # Get field_raw_data, which are the bytes of the field as uint8 for this
                 # packet
-                bit_offset = bit_offsets_cur[field._name]
-                nbytes_file = (
-                    (bit_offset + field._bit_length - 1) // BITS_PER_BYTE
-                    - bit_offset // BITS_PER_BYTE
-                    + 1
-                )
+                config = field_configs[field._name]
+                
+                if config["is_expanding"]:
+                    # Expanding field: compute nbytes_file dynamically
+                    bit_offset = bit_offsets_cur[field._name]
+                    nbytes_file = (
+                        (bit_offset + field._bit_length - 1) // BITS_PER_BYTE
+                        - bit_offset // BITS_PER_BYTE
+                        + 1
+                    )
+                    nbytes_final = {3: 4, 5: 8, 6: 8, 7: 8}.get(nbytes_file, nbytes_file)
+                    xbytes = int(nbytes_final) - int(nbytes_file)
+                    is_byte_aligned = (bit_offset % BITS_PER_BYTE == 0) and (
+                        bit_length % BITS_PER_BYTE == 0
+                    )
+                else:
+                    # Non-expanding field: use precomputed values
+                    nbytes_file = config["nbytes_file"]
+                    nbytes_final = config["nbytes_final"]
+                    xbytes = config["xbytes"]
+                    is_byte_aligned = config["is_byte_aligned_static"]
 
-                nbytes_final = {3: 4, 5: 8, 6: 8, 7: 8}.get(nbytes_file, nbytes_file)
-                xbytes = int(nbytes_final) - int(nbytes_file)
-                field_raw_data = np.zeros(nbytes_final, "u1")
+                if is_byte_aligned:
+                    stop_byte = start_byte + nbytes_file
+                    if xbytes == 0:
+                        field_raw_data = np.array(file_bytes[start_byte:stop_byte], copy=True)
+                    else:
+                        field_raw_data = np.zeros(nbytes_final, "u1")
+                        field_raw_data[xbytes:] = file_bytes[start_byte:stop_byte]
+                else:
+                    field_raw_data = np.zeros(nbytes_final, "u1")
 
-                for i in range(xbytes, nbytes_final):
-                    idx = start_byte + i - xbytes
-                    field_raw_data[i] = file_bytes[idx]
+                    for i in range(xbytes, nbytes_final):
+                        idx = start_byte + i - xbytes
+                        field_raw_data[i] = file_bytes[idx]
 
             # Switch dtype of byte arrays to the final dtype, and apply masks and shifts
             # to interpret the correct bits.
@@ -383,6 +509,8 @@ def _decode_variable_length(file_bytes, fields):
 
             if field._data_type in ("uint", "int"):
                 if not isinstance(field._array_shape, str):
+                    config = field_configs[field._name]
+                    
                     last_byte = int(start_byte) + int(nbytes_file)
                     end_last_parent_byte = last_byte * BITS_PER_BYTE
 
@@ -392,7 +520,12 @@ def _decode_variable_length(file_bytes, fields):
 
                     last_occupied_bit = packet_start * BITS_PER_BYTE + b + bit_length
 
-                    left_bits_before_shift = b % BITS_PER_BYTE
+                    # Use precomputed left_bits if available (non-expanding field)
+                    if not config["is_expanding"]:
+                        left_bits_before_shift = config["left_bits_before_shift"]
+                    else:
+                        left_bits_before_shift = b % BITS_PER_BYTE
+                    
                     right_shift = end_last_parent_byte - last_occupied_bit
 
                     assert right_shift >= 0, f"right_shift={right_shift}, {field}"

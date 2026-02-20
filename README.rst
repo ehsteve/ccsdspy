@@ -52,6 +52,23 @@ To install ccsdspy
 
    pip install ccsdspy
 
+Optional Cython acceleration
+============================
+Variable-length packet parsing includes an optional Cython-accelerated path.
+To enable it when installing from source, set ``CCSDSPY_BUILD_CYTHON=1``.
+
+.. code::
+
+    CCSDSPY_BUILD_CYTHON=1 pip install .
+
+Benchmarking variable-length parsing
+====================================
+You can compare Python vs Cython scanner performance with:
+
+.. code::
+
+    python benchmarks/benchmark_varlength.py
+
 Usage Example
 =============
 The following example shows how simple it is to read in fixed length CCSDS packets.
